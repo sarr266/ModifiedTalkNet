@@ -1,0 +1,118 @@
+from typing import List, Dict, Tuple
+import face_recognition
+import numpy as np
+import cv2
+from tqdm import tqdm
+
+# Global variables to store embeddings and labels
+known_embeddings: List[np.ndarray] = []
+known_labels: List[str] = []
+
+# Function to compare a new embedding with known embeddings
+def compare_embeddings(new_embedding: np.ndarray, threshold: float = 0.6) -> Tuple[bool, str]:
+    """
+    Compare a new embedding with known embeddings.
+    If a match is found, return (True, matching_label).
+    If no match is found, return (False, None).
+    """
+    if len(known_embeddings) == 0:
+        return False, None
+
+    # Calculate face distances between the new embedding and known embeddings
+    face_distances = face_recognition.face_distance(known_embeddings, new_embedding)
+
+    # Find the closest match
+    min_distance_index = np.argmin(face_distances)
+    min_distance = face_distances[min_distance_index]
+
+    # If the closest match is below the threshold, return the corresponding label
+    if min_distance < threshold:
+        return True, known_labels[min_distance_index]
+    else:
+        return False, None
+
+# Function to process a video frame and detect faces
+def process_frame(frame: np.ndarray) -> List[Tuple[str, List[Tuple[int, int, int, int]]]]:
+    """
+    Process a video frame to detect faces, generate embeddings, and assign labels.
+    Returns a list of tuples (label, face_location) for each detected face.
+    """
+    # Detect face locations in the frame
+    face_locations = face_recognition.face_locations(frame)
+    face_embeddings = face_recognition.face_encodings(frame, face_locations)
+
+    results = []
+    for embedding, face_location in zip(face_embeddings, face_locations):
+        # Compare the embedding with known embeddings
+        is_match, label = compare_embeddings(embedding)
+
+        if not is_match:
+            # If no match, assign a new label
+            label = f"unknown{len(known_labels) + 1}"
+            known_embeddings.append(embedding)
+            known_labels.append(label)
+
+        results.append((label, face_location))
+
+    return results
+
+# Main function to process the video
+def process_video(video_path: str, output_path: str = "output_video.mp4"):
+    """
+    Process a video to detect faces, generate embeddings, and assign labels.
+    Saves the output video with bounding boxes and labels.
+    """
+    # Open the video file
+    video_capture = cv2.VideoCapture(video_path)
+    if not video_capture.isOpened():
+        print(f"Error: Could not open video file {video_path}.")
+        return
+
+    # Get video properties
+    frame_width = int(video_capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_height = int(video_capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = int(video_capture.get(cv2.CAP_PROP_FPS))
+
+    # Define the codec and create a VideoWriter object to save the output video
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Use 'mp4v' codec for .mp4 files
+    out = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
+    if not out.isOpened():
+        print("Error: Could not open output video file.")
+        return
+
+    # Get total number of frames for progress tracking
+    total_frames = int(video_capture.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    # Process each frame
+    for _ in tqdm(range(total_frames), desc="Processing Video"):
+        ret, frame = video_capture.read()
+        if not ret:
+            break  # End of video
+
+        # Convert the frame from BGR (OpenCV) to RGB (face_recognition)
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        # Process the frame
+        results = process_frame(rgb_frame)
+
+        # Draw bounding boxes and labels on the frame
+        for label, (top, right, bottom, left) in results:
+            # Draw a rectangle around the face
+            cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 2)
+
+            # Draw a label with the name below the face
+            cv2.putText(frame, label, (left, bottom + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+        # Write the frame to the output video
+        out.write(frame)
+
+    # Release the video capture and writer objects
+    video_capture.release()
+    out.release()
+    print(f"Output video saved to {output_path}")
+
+# Example usage
+if __name__ == "__main__":
+    video_path = r"H:\talknetv2\TalkNet-ASD\demo\harrypotter3.mp4"
+    output_path = "output_video.mp4"  # Output video path
+    process_video(video_path, output_path)
