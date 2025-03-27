@@ -1,0 +1,171 @@
+import face_recognition
+import numpy as np
+import cv2
+from tqdm import tqdm
+from collections import defaultdict
+from typing import List  # For type hints
+  # For np.ndarray
+
+class FaceTracker:
+    def __init__(self, threshold: float = 0.6, history_size: int = 10):
+        """
+        Initialize the face tracker with automatic ID assignment.
+        
+        :param threshold: Maximum distance between face embeddings to be considered a match
+        :param history_size: Number of previous embeddings to store for each face
+        """
+        self.known_embeddings = []  # Stores all face encodings we've seen
+        self.face_ids = []          # Parallel list storing ID for each encoding
+        self.next_id = 1             # Next available ID
+        self.threshold = threshold
+        self.history_size = history_size
+        
+        # For each face ID, store recent embeddings to improve matching
+        self.face_history = defaultdict(list)
+    
+    def _get_new_id(self) -> str:
+        """Generate a new unique face ID"""
+        new_id = f"ID{self.next_id}"
+        self.next_id += 1
+        return new_id
+    
+    def _update_history(self, face_id: str, embedding: np.ndarray):
+        """Update the history of embeddings for a face"""
+        self.face_history[face_id].append(embedding)
+        # Keep only the most recent embeddings
+        if len(self.face_history[face_id]) > self.history_size:
+            self.face_history[face_id] = self.face_history[face_id][-self.history_size:]
+    
+    def track_faces(self, frame_embeddings: List[np.ndarray]) -> List[str]:
+        """
+        Track faces across frames and assign consistent IDs.
+        
+        :param frame_embeddings: Face encodings detected in current frame
+        :return: List of face IDs corresponding to each input embedding
+        """
+        if not frame_embeddings:
+            return []
+        
+        # If no known faces yet, assign new IDs to all
+        if not self.known_embeddings:
+            new_ids = [self._get_new_id() for _ in frame_embeddings]
+            self.known_embeddings.extend(frame_embeddings)
+            self.face_ids.extend(new_ids)
+            for face_id, embedding in zip(new_ids, frame_embeddings):
+                self._update_history(face_id, embedding)
+            return new_ids
+        
+        # Find best matches for each face in current frame
+        current_ids = []
+        used_indices = set()
+        
+        for embedding in frame_embeddings:
+            # Compare against all known embeddings
+            distances = face_recognition.face_distance(self.known_embeddings, embedding)
+            
+            # Find the best match that hasn't been used yet in this frame
+            best_match_idx = None
+            best_distance = float('inf')
+            
+            for idx, dist in enumerate(distances):
+                if dist < best_distance and idx not in used_indices and dist < self.threshold:
+                    best_distance = dist
+                    best_match_idx = idx
+            
+            if best_match_idx is not None:
+                # Found a match - use existing ID
+                face_id = self.face_ids[best_match_idx]
+                used_indices.add(best_match_idx)
+                # Update with current embedding
+                self.known_embeddings[best_match_idx] = embedding
+            else:
+                # No match found - assign new ID
+                face_id = self._get_new_id()
+                self.known_embeddings.append(embedding)
+                self.face_ids.append(face_id)
+            
+            current_ids.append(face_id)
+            self._update_history(face_id, embedding)
+        
+        return current_ids
+
+def process_video(input_path: str, output_path: str):
+    """
+    Process video to track faces with consistent unique IDs.
+    
+    :param input_path: Path to input video
+    :param output_path: Path to save output video
+    """
+    tracker = FaceTracker(threshold=0.6)
+    
+    cap = cv2.VideoCapture(input_path)
+    if not cap.isOpened():
+        print(f"Error opening video file {input_path}")
+        return
+    
+    # Get video properties
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    
+    # Define output video writer
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+    
+    # Define colors for different IDs
+    colors = [
+        (0, 255, 0),    # Green
+        (255, 0, 0),    # Blue
+        (0, 0, 255),    # Red
+        (255, 255, 0),  # Cyan
+        (0, 255, 255),  # Yellow
+        (255, 0, 255),  # Magenta
+        (128, 0, 0),    # Dark Blue
+        (0, 128, 0),    # Dark Green
+        (0, 0, 128),    # Dark Red
+    ]
+    
+    for _ in tqdm(range(total_frames), desc="Processing frames"):
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        # Convert to RGB (face_recognition uses RGB)
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        
+        # Detect faces
+        face_locations = face_recognition.face_locations(rgb_frame)
+        face_encodings = face_recognition.face_encodings(rgb_frame, face_locations)
+        
+        # Track faces and get IDs
+        face_ids = tracker.track_faces(face_encodings)
+        
+        # Draw results
+        for (top, right, bottom, left), face_id in zip(face_locations, face_ids):
+            # Assign color based on ID (consistent across frames)
+            color_idx = (int(face_id[2:]) - 1)  # Extract number from "ID1", "ID2" etc.
+            color = colors[color_idx % len(colors)]
+            
+            # Draw rectangle
+            cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
+            
+            # Draw label
+            label = face_id
+            cv2.putText(frame, label, (left + 6, bottom - 6), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+        
+        out.write(frame)
+    
+    cap.release()
+    out.release()
+    print(f"Output saved to {output_path}")
+
+if __name__ == "__main__":
+    input_video = r"H:\Face_Recog\OnePiece.mp4"
+    output_video = "output.mp4"
+    process_video(input_video, output_video)
+
+#r"H:\talknetv2\TalkNet-ASD\demo\harrypotter3.mp4"
+
+#r"H:\Face_Recog\OnePiece.mp4"
