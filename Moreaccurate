@@ -1,0 +1,371 @@
+import face_recognition
+import numpy as np
+import cv2
+from tqdm import tqdm
+from collections import defaultdict, deque
+from typing import List, Dict, Tuple, Optional
+from dataclasses import dataclass
+import math
+
+@dataclass
+class FaceTrack:
+    id: str
+    embeddings: deque  # Stores recent embeddings for this face
+    color: Tuple[int, int, int]
+    location_history: deque  # Stores recent locations (x, y, w, h)
+    kalman_filter: Optional[cv2.KalmanFilter] = None
+
+class FaceTracker:
+    def __init__(self, 
+                 detection_threshold: float = 0.6, 
+                 history_size: int = 10,
+                 detection_model: str = 'cnn',
+                 min_face_size: int = 40):
+        """
+        Improved face tracker with better handling of distant faces and consistent IDs.
+        
+        :param detection_threshold: Maximum distance between face embeddings to be considered a match
+        :param history_size: Number of previous embeddings to store for each face
+        :param detection_model: 'cnn' (more accurate) or 'hog' (faster)
+        :param min_face_size: Minimum face size to detect (pixels)
+        """
+        self.tracks: Dict[str, FaceTrack] = {}
+        self.next_id = 1
+        self.detection_threshold = detection_threshold
+        self.history_size = history_size
+        self.detection_model = detection_model
+        self.min_face_size = min_face_size
+        self.colors = self._generate_colors(50)  # Pre-generate 50 distinct colors
+        self.frame_count = 0
+        
+    def _generate_colors(self, n: int) -> List[Tuple[int, int, int]]:
+        """Generate n visually distinct colors"""
+        colors = []
+        for i in range(n):
+            hue = int(255 * i / n)
+            col = np.zeros((1, 1, 3), dtype=np.uint8)
+            col[0, 0, 0] = hue
+            col[0, 0, 1] = 255  # Saturation
+            col[0, 0, 2] = 255  # Value
+            cv_col = cv2.cvtColor(col, cv2.COLOR_HSV2BGR)
+            colors.append((int(cv_col[0, 0, 0]), int(cv_col[0, 0, 1]), int(cv_col[0, 0, 2])))
+        return colors
+    
+    def _get_new_id(self) -> str:
+        """Generate a new unique face ID"""
+        new_id = f"ID{self.next_id}"
+        self.next_id += 1
+        return new_id
+    
+    def _initialize_kalman_filter(self) -> cv2.KalmanFilter:
+        """Initialize Kalman filter for face tracking"""
+        kf = cv2.KalmanFilter(4, 2)  # 4 state vars (x, y, vx, vy), 2 measurement vars (x, y)
+        kf.measurementMatrix = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], np.float32)
+        kf.transitionMatrix = np.array([[1, 0, 1, 0], [0, 1, 0, 1], [0, 0, 1, 0], [0, 0, 0, 1]], np.float32)
+        kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.03
+        return kf
+    
+    def _detect_faces_multi_scale(self, rgb_frame: np.ndarray) -> List[Tuple[int, int, int, int]]:
+        """Detect faces at multiple scales to better handle distant/small faces"""
+        # Start with the original frame
+        faces = face_recognition.face_locations(rgb_frame, model=self.detection_model)
+        
+        # If no faces detected or smallest face is still too big, try downscaling
+        if not faces or (faces and min(right-left for (top, right, bottom, left) in faces) > self.min_face_size * 2):
+            # Try downscaled versions
+            for scale in [0.75, 0.5, 0.33]:
+                small_frame = cv2.resize(rgb_frame, (0, 0), fx=scale, fy=scale)
+                small_faces = face_recognition.face_locations(small_frame, model=self.detection_model)
+                
+                # Scale back up the face locations
+                small_faces = [(int(top/scale), int(right/scale), int(bottom/scale), int(left/scale)) 
+                              for (top, right, bottom, left) in small_faces]
+                
+                # Filter out faces that are too small
+                small_faces = [face for face in small_faces 
+                              if (face[1]-face[3]) >= self.min_face_size and (face[2]-face[0]) >= self.min_face_size]
+                
+                faces.extend(small_faces)
+        
+        # Remove duplicate detections
+        faces = self._non_max_suppression(faces)
+        return faces
+    
+    def _non_max_suppression(self, boxes: List[Tuple[int, int, int, int]], overlap_thresh: float = 0.3) -> List[Tuple[int, int, int, int]]:
+        """Suppress overlapping boxes"""
+        if len(boxes) == 0:
+            return []
+        
+        # Convert to x1,y1,x2,y2 format
+        boxes_np = np.array([(left, top, right, bottom) for (top, right, bottom, left) in boxes])
+        
+        # Initialize the list of picked indexes
+        pick = []
+        
+        # Grab the coordinates
+        x1 = boxes_np[:, 0]
+        y1 = boxes_np[:, 1]
+        x2 = boxes_np[:, 2]
+        y2 = boxes_np[:, 3]
+        
+        # Compute the area of the bounding boxes
+        area = (x2 - x1 + 1) * (y2 - y1 + 1)
+        
+        # Sort by bottom-right y-coordinate
+        idxs = np.argsort(y2)
+        
+        # Keep looping while some indexes still remain in the indexes list
+        while len(idxs) > 0:
+            # Grab the last index and add to picked list
+            last = len(idxs) - 1
+            i = idxs[last]
+            pick.append(i)
+            
+            # Find largest (x, y) coordinates for start of box
+            xx1 = np.maximum(x1[i], x1[idxs[:last]])
+            yy1 = np.maximum(y1[i], y1[idxs[:last]])
+            xx2 = np.minimum(x2[i], x2[idxs[:last]])
+            yy2 = np.minimum(y2[i], y2[idxs[:last]])
+            
+            # Compute width and height of the overlap
+            w = np.maximum(0, xx2 - xx1 + 1)
+            h = np.maximum(0, yy2 - yy1 + 1)
+            
+            # Compute overlap ratio
+            overlap = (w * h) / area[idxs[:last]]
+            
+            # Delete indexes with overlap greater than threshold
+            idxs = np.delete(idxs, np.concatenate(([last], np.where(overlap > overlap_thresh)[0])))
+        
+        # Return only the non-suppressed boxes
+        return [boxes[i] for i in pick]
+    
+    def _predict_tracks(self):
+        """Predict new locations of existing tracks using Kalman filters"""
+        for track_id, track in self.tracks.items():
+            if track.kalman_filter is not None:
+                prediction = track.kalman_filter.predict()
+                # Update the last known position with prediction
+                if track.location_history:
+                    last_pos = track.location_history[-1]
+                    predicted_pos = (
+                        int(prediction[0][0]),
+                        int(prediction[1][0]),
+                        last_pos[2],  # Keep original width
+                        last_pos[3]   # Keep original height
+                    )
+                    track.location_history.append(predicted_pos)
+                    if len(track.location_history) > self.history_size:
+                        track.location_history.popleft()
+    
+    def _match_faces(self, face_encodings: List[np.ndarray], face_locations: List[Tuple[int, int, int, int]]) -> List[str]:
+        """Match detected faces with existing tracks"""
+        current_ids = []
+        used_track_ids = set()
+        
+        for i, (encoding, location) in enumerate(zip(face_encodings, face_locations)):
+            best_match_id = None
+            best_distance = float('inf')
+            
+            # Calculate center of current face
+            (top, right, bottom, left) = location
+            current_center = ((left + right) // 2, (top + bottom) // 2)
+            current_size = (right - left) * (bottom - top)
+            
+            # Compare against all known tracks
+            for track_id, track in self.tracks.items():
+                if track_id in used_track_ids:
+                    continue
+                
+                # Get last known position and size
+                if track.location_history:
+                    last_location = track.location_history[-1]
+                    (last_left, last_top, last_right, last_bottom) = last_location
+                    last_center = ((last_left + last_right) // 2, (last_top + last_bottom) // 2)
+                    last_size = (last_right - last_left) * (last_bottom - last_top)
+                    
+                    # Calculate position and size differences
+                    center_distance = math.sqrt((current_center[0] - last_center[0])**2 + 
+                                               (current_center[1] - last_center[1])**2)
+                    size_ratio = max(current_size, last_size) / min(current_size, last_size)
+                    
+                    # Position and size must be reasonably close
+                    if center_distance > 100 or size_ratio > 2.0:
+                        continue
+                
+                # Calculate appearance distance using historical embeddings
+                hist_embeddings = list(track.embeddings)
+                distances = face_recognition.face_distance(hist_embeddings, encoding)
+                avg_distance = np.mean(distances)
+                
+                # Combined score (weighted average of appearance and motion)
+                combined_score = 0.7 * avg_distance + 0.3 * (center_distance / 100 if track.location_history else 0)
+                
+                if combined_score < best_distance and combined_score < self.detection_threshold:
+                    best_distance = combined_score
+                    best_match_id = track_id
+            
+            if best_match_id is not None:
+                # Found a match - use existing track
+                current_ids.append(best_match_id)
+                used_track_ids.add(best_match_id)
+                
+                # Update track with new information
+                track = self.tracks[best_match_id]
+                track.embeddings.append(encoding)
+                if len(track.embeddings) > self.history_size:
+                    track.embeddings.popleft()
+                
+                # Update Kalman filter
+                if track.kalman_filter is not None:
+                    center_x = (left + right) // 2
+                    center_y = (top + bottom) // 2
+                    measurement = np.array([[np.float32(center_x)], [np.float32(center_y)]])
+                    track.kalman_filter.correct(measurement)
+                
+                # Update location history
+                track.location_history.append((left, top, right, bottom))
+                if len(track.location_history) > self.history_size:
+                    track.location_history.popleft()
+            else:
+                # No match found - create new track
+                new_id = self._get_new_id()
+                current_ids.append(new_id)
+                
+                # Initialize Kalman filter
+                kf = self._initialize_kalman_filter()
+                center_x = (left + right) // 2
+                center_y = (top + bottom) // 2
+                kf.statePost = np.array([[np.float32(center_x)], 
+                                        [np.float32(center_y)], 
+                                        [0], 
+                                        [0]], dtype=np.float32)
+                
+                # Create new track
+                self.tracks[new_id] = FaceTrack(
+                    id=new_id,
+                    embeddings=deque([encoding], maxlen=self.history_size),
+                    color=self.colors[(self.next_id - 2) % len(self.colors)],
+                    location_history=deque([(left, top, right, bottom)], maxlen=self.history_size),
+                    kalman_filter=kf
+                )
+        
+        return current_ids
+    
+    def track_faces(self, rgb_frame: np.ndarray) -> Tuple[List[Tuple[int, int, int, int]], List[str]]:
+        """
+        Track faces across frames with improved handling of distant faces.
+        
+        :param rgb_frame: Current frame in RGB format
+        :return: Tuple of (face_locations, face_ids)
+        """
+        self.frame_count += 1
+        
+        # First predict movement of existing tracks
+        self._predict_tracks()
+        
+        # Detect faces (with multi-scale handling)
+        face_locations = self._detect_faces_multi_scale(rgb_frame)
+        
+        # Get face encodings
+        face_encodings = face_recognition.face_encodings(rgb_frame, face_locations)
+        
+        # Match with existing tracks or create new ones
+        face_ids = self._match_faces(face_encodings, face_locations) if face_locations else []
+        
+        # Remove tracks that haven't been seen in a while
+        self._remove_stale_tracks()
+        
+        return face_locations, face_ids
+    
+    def _remove_stale_tracks(self, max_missed_frames: int = 10):
+        """Remove tracks that haven't been matched in recent frames"""
+        active_ids = set()
+        to_remove = []
+        
+        for track_id, track in self.tracks.items():
+            if len(track.location_history) > 0:
+                # Get age of last detection (in frames)
+                last_detection_age = self.frame_count - len(track.location_history)
+                if last_detection_age > max_missed_frames:
+                    to_remove.append(track_id)
+        
+        for track_id in to_remove:
+            del self.tracks[track_id]
+
+def process_video(input_path: str, output_path: str):
+    """
+    Process video to track faces with consistent unique IDs.
+    
+    :param input_path: Path to input video
+    :param output_path: Path to save output video
+    """
+    tracker = FaceTracker(
+        detection_threshold=0.55,  # Slightly more lenient threshold
+        history_size=15,           # Keep more history for better matching
+        detection_model='cnn',    # More accurate but slower model
+        min_face_size=30          # Detect smaller faces
+    )
+    
+    cap = cv2.VideoCapture(input_path)
+    if not cap.isOpened():
+        print(f"Error opening video file {input_path}")
+        return
+    
+    # Get video properties
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    
+    # Define output video writer
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+    
+    for _ in tqdm(range(total_frames), desc="Processing frames"):
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        # Convert to RGB (face_recognition uses RGB)
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        
+        # Track faces
+        face_locations, face_ids = tracker.track_faces(rgb_frame)
+        
+        # Draw results
+        for (top, right, bottom, left), face_id in zip(face_locations, face_ids):
+            track = tracker.tracks.get(face_id)
+            if track is None:
+                continue
+                
+            color = track.color
+            
+            # Draw rectangle
+            cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
+            
+            # Draw label with confidence
+            label = face_id
+            cv2.putText(frame, label, (left + 6, bottom - 6), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+            
+            # Draw tracking history
+            if len(track.location_history) > 1:
+                centers = []
+                for loc in track.location_history:
+                    l, t, r, b = loc
+                    centers.append(((l + r) // 2, (t + b) // 2))
+                
+                for i in range(1, len(centers)):
+                    cv2.line(frame, centers[i-1], centers[i], color, 1)
+        
+        out.write(frame)
+    
+    cap.release()
+    out.release()
+    print(f"Output saved to {output_path}")
+
+if __name__ == "__main__":
+    input_video = r"H:\Face_Recog\strangerthings.mp4"
+    output_video = "output_improved.mp4"
+    process_video(input_video, output_video)
