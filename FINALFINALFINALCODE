@@ -1,0 +1,168 @@
+import face_recognition
+import numpy as np
+import cv2
+from tqdm import tqdm
+from collections import defaultdict
+import os
+import matplotlib.pyplot as plt
+
+class FaceTracker:
+    def __init__(self, threshold=0.6, history_size=10):
+        self.known_embeddings = []
+        self.face_ids = []
+        self.next_id = 1
+        self.threshold = threshold
+        self.history_size = history_size
+        self.face_history = defaultdict(list)
+
+    def _get_new_id(self):
+        new_id = f"ID{self.next_id}"
+        self.next_id += 1
+        return new_id
+
+    def _update_history(self, face_id, embedding):
+        self.face_history[face_id] = (self.face_history[face_id] + [embedding])[-self.history_size:]
+
+    def track_faces(self, frame_embeddings):
+        if not frame_embeddings:
+            return []
+        
+        if not self.known_embeddings:
+            new_ids = [self._get_new_id() for _ in frame_embeddings]
+            self.known_embeddings.extend(frame_embeddings)
+            self.face_ids.extend(new_ids)
+            for face_id, embedding in zip(new_ids, frame_embeddings):
+                self._update_history(face_id, embedding)
+            return new_ids
+        
+        current_ids, used_indices = [], set()
+        
+        for embedding in frame_embeddings:
+            distances = face_recognition.face_distance(self.known_embeddings, embedding)
+            valid_indices = [i for i, d in enumerate(distances) 
+                            if d < self.threshold and i not in used_indices]
+            
+            if valid_indices:
+                best_idx = min(valid_indices, key=lambda i: distances[i])
+                face_id = self.face_ids[best_idx]
+                used_indices.add(best_idx)
+                self.known_embeddings[best_idx] = embedding
+            else:
+                face_id = self._get_new_id()
+                self.known_embeddings.append(embedding)
+                self.face_ids.append(face_id)
+            
+            current_ids.append(face_id)
+            self._update_history(face_id, embedding)
+        
+        return current_ids
+
+def process_video(input_path):
+    tracker = FaceTracker()
+    face_appearances = defaultdict(list)
+    face_samples = {}
+    
+    cap = cv2.VideoCapture(input_path)
+    if not cap.isOpened():
+        print(f"Error opening video file {input_path}")
+        return None
+    
+    props = lambda x: int(cap.get(x))
+    width, height = props(cv2.CAP_PROP_FRAME_WIDTH), props(cv2.CAP_PROP_FRAME_HEIGHT)
+    fps, total_frames = props(cv2.CAP_PROP_FPS), props(cv2.CAP_PROP_FRAME_COUNT)
+    
+    for frame_number in tqdm(range(total_frames), desc="Processing video"):
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        face_locations = face_recognition.face_locations(rgb_frame)
+        face_encodings = face_recognition.face_encodings(rgb_frame, face_locations)
+        face_ids = tracker.track_faces(face_encodings)
+        
+        for face_id, location in zip(face_ids, face_locations):
+            face_appearances[face_id].append((frame_number, location))
+            if face_id not in face_samples:
+                top, right, bottom, left = location
+                face_samples[face_id] = rgb_frame[top:bottom, left:right]
+    
+    cap.release()
+    return face_appearances, face_samples, fps, width, height
+
+def show_face_gallery(face_samples):
+    os.makedirs("temp_faces", exist_ok=True)
+    for face_id, img in face_samples.items():
+        cv2.imwrite(f"temp_faces/{face_id}.jpg", cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+    
+    plt.figure(figsize=(15, 3 * ((len(face_samples) + 4) // 5)))
+    plt.suptitle("Select a face ID to view all appearances", y=1.05)
+    
+    for i, (face_id, img) in enumerate(face_samples.items()):
+        plt.subplot((len(face_samples) + 4) // 5, 5, i + 1)
+        plt.imshow(img)
+        plt.title(face_id)
+        plt.axis('off')
+    
+    plt.tight_layout()
+    plt.show()
+    
+    while True:
+        selected_id = input("Enter the ID of the face you want to track (e.g., ID1): ")
+        if selected_id in face_samples:
+            return selected_id
+        print("Invalid ID. Please try again.")
+
+def generate_selected_face_video(input_path, output_path, face_appearances, selected_id, fps, width, height):
+    appearances = face_appearances.get(selected_id, [])
+    if not appearances:
+        print(f"No appearances found for {selected_id}")
+        return
+    
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+    cap = cv2.VideoCapture(input_path)
+    
+    selected_frames = {frame for frame, _ in appearances}
+    current_scene_start = prev_frame = None
+    
+    for frame_number in tqdm(range(int(cap.get(cv2.CAP_PROP_FRAME_COUNT))), desc="Generating output video"):
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        if frame_number in selected_frames:
+            face_locations = [loc for fn, loc in appearances if fn == frame_number]
+            color = (0, 255, 0)
+            
+            for (top, right, bottom, left) in face_locations:
+                cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
+                cv2.putText(frame, selected_id, (left + 6, bottom - 6), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+            
+            if prev_frame is None or frame_number != prev_frame + 1:
+                current_scene_start = frame_number / fps
+            
+            timestamp = frame_number / fps
+            scene_duration = timestamp - current_scene_start
+            timestamp_text = f"Time: {timestamp:.2f}s | Scene: {current_scene_start:.2f}s - {timestamp:.2f}s ({scene_duration:.2f}s)"
+            cv2.putText(frame, timestamp_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            
+            out.write(frame)
+            prev_frame = frame_number
+    
+    cap.release()
+    out.release()
+    print(f"Output saved to {output_path}")
+
+if __name__ == "__main__":
+    input_video = r"H:\Face_Recog\strangerthings.mp4"
+    output_video = "output.mp4"
+    
+    results = process_video(input_video)
+    if results:
+        face_appearances, face_samples, fps, width, height = results
+        selected_id = show_face_gallery(face_samples)
+        generate_selected_face_video(input_video, output_video, face_appearances, selected_id, fps, width, height)
+
+#r"H:\Face_Recog\strangerthings.mp4"
