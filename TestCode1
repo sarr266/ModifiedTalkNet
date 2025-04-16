@@ -1,0 +1,103 @@
+import face_recognition
+import cv2
+
+# Open the input movie file
+input_movie = cv2.VideoCapture("strangerthings.mp4")
+length = int(input_movie.get(cv2.CAP_PROP_FRAME_COUNT))
+frame_width = int(input_movie.get(cv2.CAP_PROP_FRAME_WIDTH))
+frame_height = int(input_movie.get(cv2.CAP_PROP_FRAME_HEIGHT))
+fps = input_movie.get(cv2.CAP_PROP_FPS)
+
+# Create an output movie file in MP4 format
+fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Use 'mp4v' codec for MP4 format
+output_movie = cv2.VideoWriter('output.mp4', fourcc, fps, (frame_width, frame_height))
+
+# Initialize variables for face tracking
+face_locations = []
+face_encodings = []
+face_names = []
+frame_number = 0
+
+# Store known face encodings and their corresponding IDs
+known_face_encodings = []
+known_face_ids = []
+next_id = 1  # Starting ID number
+
+# Threshold for face comparisons (lower is more strict)
+FACE_MATCH_THRESHOLD = 0.6
+
+while True:
+    # Grab a single frame of video
+    ret, frame = input_movie.read()
+    frame_number += 1
+
+    # Quit when the input video file ends
+    if not ret:
+        break
+
+    # Convert the image from BGR color (OpenCV) to RGB color (face_recognition)
+    # Fixed RGB conversion - single step conversion
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+    # Find all the faces and face encodings in the current frame of video
+    face_locations = face_recognition.face_locations(rgb_frame)
+    face_encodings = face_recognition.face_encodings(rgb_frame, face_locations)
+
+    face_names = []
+    for face_encoding in face_encodings:
+        # See if this face matches any known faces
+        if known_face_encodings:
+            matches = face_recognition.compare_faces(
+                known_face_encodings, 
+                face_encoding, 
+                tolerance=FACE_MATCH_THRESHOLD
+            )
+            
+            # Find the best match (lowest distance)
+            face_distances = face_recognition.face_distance(
+                known_face_encodings, 
+                face_encoding
+            )
+            best_match_index = face_distances.argmin()
+            
+            if matches[best_match_index]:
+                # Use the ID of the best matching known face
+                name = known_face_ids[best_match_index]
+            else:
+                # Add this as a new known face
+                name = f"ID{next_id}"
+                next_id += 1
+                known_face_encodings.append(face_encoding)
+                known_face_ids.append(name)
+        else:
+            # First face found - add it to known faces
+            name = f"ID{next_id}"
+            next_id += 1
+            known_face_encodings.append(face_encoding)
+            known_face_ids.append(name)
+
+        face_names.append(name)
+
+    # Label the results
+    for (top, right, bottom, left), name in zip(face_locations, face_names):
+        # Draw a box around the face
+        cv2.rectangle(frame, (left, top), (right, bottom), (0, 0, 255), 2)
+
+        # Draw a label with the face ID below the face
+        cv2.rectangle(frame, (left, bottom - 25), (right, bottom), (0, 0, 255), cv2.FILLED)
+        font = cv2.FONT_HERSHEY_DUPLEX
+        cv2.putText(frame, name, (left + 6, bottom - 6), font, 0.5, (255, 255, 255), 1)
+
+    # Write the resulting image to the output video file
+    print("Processing frame {} / {}".format(frame_number, length))
+    output_movie.write(frame)
+
+# Print summary of found faces
+print("\nFound {} unique faces in the video:".format(len(known_face_ids)))
+for face_id in known_face_ids:
+    print("-", face_id)
+
+# All done!
+input_movie.release()
+output_movie.release()
+cv2.destroyAllWindows()
