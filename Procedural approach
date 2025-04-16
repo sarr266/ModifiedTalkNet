@@ -1,0 +1,87 @@
+import face_recognition
+import cv2
+import numpy as np
+
+input_movie = cv2.VideoCapture("strangerthings.mp4")
+length = int(input_movie.get(cv2.CAP_PROP_FRAME_COUNT))
+frame_width = int(input_movie.get(cv2.CAP_PROP_FRAME_WIDTH))
+frame_height = int(input_movie.get(cv2.CAP_PROP_FRAME_HEIGHT))
+fps = input_movie.get(cv2.CAP_PROP_FPS)
+
+fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+output_movie = cv2.VideoWriter('output.mp4', fourcc, fps, (frame_width, frame_height))
+
+known_face_encodings = []
+known_face_ids = []
+next_id = 1
+
+FACE_MATCH_THRESHOLD = 0.55  # Lower = stricter matching
+SKIP_FRAMES = 2  # Process every Nth frame for speed (1 = no skipping)
+HISTORY_SIZE = 5  # Keep track of past N encodings per face for stability
+
+face_history = {} # Store history of face encodings for better tracking
+
+def get_best_match(face_encoding):
+    """Finds the best matching face with history-based voting."""
+    if not known_face_encodings:
+        return None
+
+    distances = face_recognition.face_distance(known_face_encodings, face_encoding)  # Compare against all known faces
+    best_match_idx = distances.argmin()
+
+    if distances[best_match_idx] < FACE_MATCH_THRESHOLD:
+        return best_match_idx
+    return None
+
+frame_number = 0
+while True:
+    ret, frame = input_movie.read()
+    frame_number += 1
+
+    if not ret:
+        break
+
+    if frame_number % SKIP_FRAMES != 0:  # Skip frames for faster processing (optional)
+        continue
+
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+    face_locations = face_recognition.face_locations(rgb_frame)    # Detect faces
+    face_encodings = face_recognition.face_encodings(rgb_frame, face_locations)
+
+    face_names = []
+    for face_encoding in face_encodings:
+        match_idx = get_best_match(face_encoding)
+
+        if match_idx is not None:
+            face_id = known_face_ids[match_idx] # Existing face
+            
+            if face_id in face_history:   # Update history for stability
+                face_history[face_id].append(face_encoding)
+                if len(face_history[face_id]) > HISTORY_SIZE:
+                    face_history[face_id].pop(0)
+
+                avg_encoding = np.mean(face_history[face_id], axis=0) # Use average of history for better stability
+                known_face_encodings[match_idx] = avg_encoding
+            else:
+                face_history[face_id] = [face_encoding]
+        else:
+            face_id = f"ID{next_id}" # New face
+            next_id += 1
+            known_face_encodings.append(face_encoding)
+            known_face_ids.append(face_id)
+            face_history[face_id] = [face_encoding]
+
+        face_names.append(face_id)
+
+    for (top, right, bottom, left), name in zip(face_locations, face_names):
+        cv2.rectangle(frame, (left, top), (right, bottom), (0, 0, 255), 2)
+        cv2.rectangle(frame, (left, bottom - 25), (right, bottom), (0, 0, 255), cv2.FILLED)
+        cv2.putText(frame, name, (left + 6, bottom - 6), cv2.FONT_HERSHEY_DUPLEX, 0.5, (255, 255, 255), 1)
+
+    output_movie.write(frame)
+    print(f"Processed frame {frame_number}/{length}")
+
+input_movie.release()
+output_movie.release()
+cv2.destroyAllWindows()
